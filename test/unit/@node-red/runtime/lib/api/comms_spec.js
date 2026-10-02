@@ -318,4 +318,145 @@ describe("runtime-api/comms", function() {
         });
     })
 
+    describe("targeted publish", function() {
+        var messages1 = [];
+        var messages2 = [];
+        var conn1 = { session: "session-1", send: function(topic,data){messages1.push({topic,data})} }
+        var conn2 = { session: "session-2", send: function(topic,data){messages2.push({topic,data})} }
+        var eventHandlers = {};
+        before(function() {
+            sinon.stub(events,"removeListener").callsFake(function() {})
+            sinon.stub(events,"on").callsFake(function(evt,handler) { eventHandlers[evt] = handler })
+            comms.init({ log: { trace: function(){}, warn: function(){} } })
+        })
+        after(function() {
+            events.removeListener.restore();
+            events.on.restore();
+        })
+        beforeEach(function(done) {
+            messages1 = [];
+            messages2 = [];
+            comms.addConnection({client: conn1}).then(function() {
+                comms.addConnection({client: conn2}).then(done);
+            });
+        })
+        afterEach(function(done) {
+            comms.removeConnection({client: conn1}).then(function() {
+                comms.removeConnection({client: conn2}).then(done);
+            });
+        })
+
+        it('publishes to everyone by default',function() {
+            return comms.publish({topic:"t",data:"d"}).then(function() {
+                messages1.should.have.length(1);
+                messages2.should.have.length(1);
+            });
+        })
+        it('publishes to a single session only',function() {
+            return comms.publish({topic:"t",data:"d",session:"session-2"}).then(function() {
+                messages1.should.have.length(0);
+                messages2.should.have.length(1);
+                messages2[0].should.have.property("topic","t");
+                messages2[0].should.have.property("data","d");
+            });
+        })
+        it('publishes to all but the excluded session',function() {
+            return comms.publish({topic:"t",data:"d",excludeSession:"session-1"}).then(function() {
+                messages1.should.have.length(0);
+                messages2.should.have.length(1);
+            });
+        })
+        it('does not retain targeted messages',function() {
+            return comms.publish({topic:"r",data:"d",session:"session-1"}).then(function() {
+                // A later subscription must not replay the targeted message
+                return comms.subscribe({client: conn2, topic: "r"}).then(function() {
+                    messages2.should.have.length(0);
+                });
+            });
+        })
+    })
+
+    describe("messages from the editor", function() {
+        var eventHandlers = {};
+        before(function() {
+            sinon.stub(events,"removeListener").callsFake(function() {})
+            sinon.stub(events,"on").callsFake(function(evt,handler) { eventHandlers[evt] = handler })
+            comms.init({ log: { trace: function(){}, warn: function(){} } })
+        })
+        after(function() {
+            events.removeListener.restore();
+            events.on.restore();
+        })
+
+        it('delivers messages to matching subscribers with session and user',function() {
+            var received = [];
+            return comms.subscribeMessages({topic:"plugin/run",callback:function(topic,data,info){
+                received.push({topic,data,info})
+            }}).then(function() {
+                return comms.receive({
+                    topic:"plugin/run",data:{a:1},session:"sess-abc",user:{username:"bob"}
+                });
+            }).then(function() {
+                received.should.have.length(1);
+                received[0].topic.should.equal("plugin/run");
+                received[0].data.should.eql({a:1});
+                received[0].info.should.eql({session:"sess-abc",user:{username:"bob"}});
+            });
+        })
+
+        it('supports wildcard subscriptions',function() {
+            var received = [];
+            var cb = function(topic,data){ received.push(topic) }
+            return comms.subscribeMessages({topic:"plugin/+/go",callback:cb}).then(function() {
+                return comms.receive({topic:"plugin/x/go",data:1});
+            }).then(function() {
+                return comms.receive({topic:"plugin/y/go",data:1});
+            }).then(function() {
+                return comms.receive({topic:"other/x/go",data:1});
+            }).then(function() {
+                received.should.eql(["plugin/x/go","plugin/y/go"]);
+            });
+        })
+
+        it('supports multi-level wildcard subscriptions',function() {
+            var received = [];
+            var cb = function(topic,data){ received.push(topic) }
+            return comms.subscribeMessages({topic:"plugin/#",callback:cb}).then(function() {
+                return comms.receive({topic:"plugin/a/b/c",data:1});
+            }).then(function() {
+                return comms.receive({topic:"nope",data:1});
+            }).then(function() {
+                received.should.eql(["plugin/a/b/c"]);
+            });
+        })
+
+        it('delivers to multiple subscribers and continues after an error',function() {
+            var calls = [];
+            var badCb = function() { throw new Error("boom") }
+            var goodCb = function() { calls.push(1) }
+            return comms.subscribeMessages({topic:"multi",callback:badCb}).then(function() {
+                return comms.subscribeMessages({topic:"multi",callback:goodCb});
+            }).then(function() {
+                return comms.receive({topic:"multi",data:null});
+            }).then(function() {
+                calls.should.eql([1]);
+            });
+        })
+
+        it('unsubscribes a specific callback',function() {
+            var count = 0;
+            var cb = function() { count++ }
+            return comms.subscribeMessages({topic:"gone",callback:cb}).then(function() {
+                return comms.receive({topic:"gone",data:1});
+            }).then(function() {
+                count.should.equal(1);
+                return comms.unsubscribeMessages({topic:"gone",callback:cb});
+            }).then(function() {
+                return comms.receive({topic:"gone",data:1});
+            }).then(function() {
+                count.should.equal(1);
+            });
+        })
+    })
+
 });

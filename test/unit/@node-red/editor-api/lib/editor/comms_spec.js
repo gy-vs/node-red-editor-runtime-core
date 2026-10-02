@@ -35,6 +35,7 @@ var listenPort = 0; // use ephemeral port
 
 describe("api/editor/comms", function() {
     var connections = [];
+    var receivedMessages = [];
     var mockComms = {
         addConnection: function(opts) {
             connections.push(opts.client);
@@ -50,7 +51,8 @@ describe("api/editor/comms", function() {
             return Promise.resolve()
         },
         subscribe: function() { return Promise.resolve()},
-        unsubscribe: function() { return Promise.resolve(); }
+        unsubscribe: function() { return Promise.resolve(); },
+        receive: function(opts) { receivedMessages.push(opts); return Promise.resolve(); }
     }
 
     describe("with default keepalive", function() {
@@ -606,6 +608,213 @@ describe("api/editor/comms", function() {
             ws.on('close', function() {
                 try {
                     count.should.equal(1);
+                    done();
+                } catch(err) {
+                    done(err);
+                }
+            });
+        });
+    });
+
+    describe("editor to runtime messages", function() {
+        var server;
+        var url;
+        var port;
+        before(function(done) {
+            sinon.stub(Users,"default").callsFake(function() { return Promise.resolve(null);});
+            server = stoppable(http.createServer(function(req,res){app(req,res)}));
+            comms.init(server, {}, {comms: mockComms});
+            server.listen(listenPort, address);
+            server.on('listening', function() {
+                port = server.address().port;
+                url = 'http://' + address + ':' + port + '/comms';
+                comms.start();
+                done();
+            });
+        });
+
+        after(function(done) {
+            Users.default.restore();
+            comms.stop();
+            server.stop(done);
+        });
+
+        beforeEach(function() {
+            receivedMessages = [];
+        });
+
+        it('delivers published messages to the runtime with session info',function(done) {
+            var ws = new WebSocket(url);
+            ws.on('open', function() {
+                ws.send(JSON.stringify({topic:"my/plugin/action",data:{value:42}}));
+                ws.send(JSON.stringify({session:null}));
+            });
+            ws.on('message', function(msg) {
+                var reply = JSON.parse(msg);
+                if (reply.session) {
+                    try {
+                        receivedMessages.should.have.length(1);
+                        receivedMessages[0].should.have.property("topic","my/plugin/action");
+                        receivedMessages[0].should.have.property("data",{value:42});
+                        receivedMessages[0].should.have.property("session",reply.session);
+                        receivedMessages[0].should.have.property("user",null);
+                        ws.close();
+                        done();
+                    } catch(err) {
+                        done(err);
+                    }
+                }
+            });
+        });
+
+        it('reports its session id when asked',function(done) {
+            var ws = new WebSocket(url);
+            ws.on('open', function() {
+                ws.send(JSON.stringify({session:null}));
+            });
+            ws.on('message', function(msg) {
+                var reply = JSON.parse(msg);
+                try {
+                    reply.should.have.property("session");
+                    reply.session.should.be.a.String();
+                    ws.close();
+                    done();
+                } catch(err) {
+                    done(err);
+                }
+            });
+        });
+    });
+
+    describe("re-authentication of an active connection", function() {
+        var server;
+        var url;
+        var port;
+        var getDefaultUser;
+        var getUser;
+        var getToken;
+        var getUserToken;
+        var onSessionExpiry;
+
+        before(function(done) {
+            getDefaultUser = sinon.stub(Users,"default").callsFake(function() {
+                return Promise.resolve({permissions:"read", anonymous: true});
+            });
+            getUser = sinon.stub(Users,"get").callsFake(function(username) {
+                if (username == "fred") {
+                    return Promise.resolve({permissions:"read",username:"fred"});
+                }
+                return Promise.resolve(null);
+            });
+            getUserToken = sinon.stub(Users,"tokens").callsFake(function() {
+                return Promise.resolve(null);
+            });
+            getToken = sinon.stub(Tokens,"get").callsFake(function(token) {
+                if (token == "1234") {
+                    return Promise.resolve({user:"fred",scope:["*"]});
+                }
+                return Promise.resolve(null);
+            });
+            onSessionExpiry = sinon.stub(Tokens,"onSessionExpiry").callsFake(function() {});
+            server = stoppable(http.createServer(function(req,res){app(req,res)}));
+            comms.init(server, {adminAuth:{}}, {comms: mockComms});
+            server.listen(listenPort, address);
+            server.on('listening', function() {
+                port = server.address().port;
+                url = 'http://' + address + ':' + port + '/comms';
+                comms.start();
+                done();
+            });
+        });
+        after(function(done) {
+            getDefaultUser.restore();
+            getUser.restore();
+            getToken.restore();
+            getUserToken.restore();
+            onSessionExpiry.restore();
+            comms.stop();
+            server.stop(done);
+        });
+
+        beforeEach(function() {
+            receivedMessages = [];
+        });
+
+        it('updates the connection identity after login without reconnect',function(done) {
+            var ws = new WebSocket(url);
+            var gotAck = false;
+            ws.on('open', function() {
+                // First connect anonymously
+                ws.send('{"subscribe":"foo"}');
+                setTimeout(function() {
+                    // Then log in by sending the new token over the same socket
+                    ws.send('{"auth":"1234"}');
+                },50);
+            });
+            ws.on('message', function(msg) {
+                if (msg === '{"auth":"ok"}') {
+                    gotAck = true;
+                    try {
+                        connections.should.have.length(1);
+                        connections[0].user.should.have.property("username","fred");
+                        ws.send(JSON.stringify({topic:"plugin/x",data:"hi"}));
+                    } catch(err) {
+                        done(err);
+                    }
+                }
+            });
+            ws.on('close', function() {
+                try {
+                    gotAck.should.be.true();
+                    var received = receivedMessages.filter(m => m.topic === "plugin/x");
+                    received.should.have.length(1);
+                    received[0].user.should.have.property("username","fred");
+                    done();
+                } catch(err) {
+                    done(err);
+                }
+            });
+            setTimeout(function() {
+                try {
+                    gotAck.should.be.true();
+                    ws.close();
+                } catch(err) {
+                    done(err);
+                }
+            },400);
+        });
+
+        it('keeps the connection alive when re-authentication uses an invalid token',function(done) {
+            var ws = new WebSocket(url);
+            var gotFail = false;
+            ws.on('open', function() {
+                ws.send('{"subscribe":"foo"}');
+                setTimeout(function() {
+                    ws.send('{"auth":"bad-token"}');
+                },50);
+            });
+            ws.on('message', function(msg) {
+                if (msg === '{"auth":"fail"}') {
+                    gotFail = true;
+                    // Existing connection should still be usable
+                    setTimeout(function() {
+                        try {
+                            connections.should.have.length(1);
+                            ws.send(JSON.stringify({topic:"plugin/y",data:"still-here"}));
+                            ws.close();
+                        } catch(err) {
+                            done(err);
+                        }
+                    },50);
+                }
+            });
+            ws.on('close', function() {
+                try {
+                    gotFail.should.be.true();
+                    var received = receivedMessages.filter(m => m.topic === "plugin/y");
+                    received.should.have.length(1);
+                    // User remains anonymous
+                    received[0].user.should.have.property("anonymous",true);
                     done();
                 } catch(err) {
                     done(err);
