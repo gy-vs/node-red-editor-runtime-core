@@ -317,5 +317,109 @@ describe("runtime-api/comms", function() {
             }).catch(done);
         });
     })
+    describe("targeted publishing", function() {
+        var eventHandlers = {};
+        var messages = [];
+        var clientConnection1 = {session:"session-1", send: function(topic,data) { messages.push({session:"session-1",topic,data}); }};
+        var clientConnection2 = {session:"session-2", send: function(topic,data) { messages.push({session:"session-2",topic,data}); }};
+        before(function() {
+            sinon.stub(events,"removeListener").callsFake(function() {})
+            sinon.stub(events,"on").callsFake(function(evt,handler) { eventHandlers[evt] = handler });
+            comms.init({log:{trace:function(){}}});
+        });
+        after(function() {
+            events.removeListener.restore();
+            events.on.restore();
+        });
+        beforeEach(function(done) {
+            messages = [];
+            Promise.all([
+                comms.addConnection({client: clientConnection1}),
+                comms.addConnection({client: clientConnection2})
+            ]).then(()=>done()).catch(done);
+        });
+        afterEach(function(done) {
+            Promise.all([
+                comms.removeConnection({client: clientConnection1}),
+                comms.removeConnection({client: clientConnection2})
+            ]).then(()=>done()).catch(done);
+        });
+
+        it('publishes to a single session',function() {
+            eventHandlers["comms"]({topic:"targeted",data:"payload",session:"session-1"});
+            messages.should.eql([{session:"session-1",topic:"targeted",data:"payload"}]);
+        });
+        it('publishes to all sessions except one',function() {
+            eventHandlers["comms"]({topic:"broadcast",data:"payload",excludeSession:"session-1"});
+            messages.should.eql([{session:"session-2",topic:"broadcast",data:"payload"}]);
+        });
+        it('does not retain targeted messages',function(done) {
+            eventHandlers["comms"]({topic:"retained-target",data:"payload",retain:true,session:"session-1"});
+            messages.should.have.length(1);
+            comms.subscribe({client: clientConnection2, topic:"retained-target"}).then(function() {
+                messages.should.have.length(1);
+                done();
+            }).catch(done);
+        });
+    });
+
+    describe("incoming messages", function() {
+        before(function() {
+            comms.init({log:{trace:function(){}}});
+        });
+
+        it('emits an event containing session, user and data',function(done) {
+            var message = {topic:"plugin/action",data:{value:"hello"},session:"expected-session",user:{username:"fred"}};
+            function handler(event) {
+                events.removeListener("comms:message:plugin/action",handler);
+                try {
+                    event.should.eql(message);
+                    done();
+                } catch(err) {
+                    done(err);
+                }
+            }
+            events.on("comms:message:plugin/action",handler);
+            comms.receive({
+                topic:"plugin/action",
+                data:{value:"hello"},
+                client:{session:"expected-session"},
+                user:{username:"fred"}
+            });
+        });
+
+        it('supports wildcard inbound subscriptions and unsubscribe',function(done) {
+            var calls = [];
+            function callback(topic,data,session,user) {
+                calls.push({topic,data,session,user});
+            }
+            comms.subscribeInbound({topic:"plugin/#",callback:callback}).then(function() {
+                return comms.receive({
+                    topic:"plugin/check",
+                    data:{value:"hello"},
+                    client:{session:"session-1"},
+                    user:{username:"fred"}
+                });
+            }).then(function() {
+                calls.should.eql([{
+                    topic:"plugin/check",
+                    data:{value:"hello"},
+                    session:"session-1",
+                    user:{username:"fred"}
+                }]);
+                return comms.unsubscribeInbound({topic:"plugin/#",callback:callback});
+            }).then(function() {
+                return comms.receive({
+                    topic:"plugin/check",
+                    data:{},
+                    client:{session:"session-1"},
+                    user:{username:"fred"}
+                });
+            }).then(function() {
+                calls.should.have.length(1);
+                done();
+            }).catch(done);
+        });
+    });
 
 });

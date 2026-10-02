@@ -50,7 +50,8 @@ describe("api/editor/comms", function() {
             return Promise.resolve()
         },
         subscribe: function() { return Promise.resolve()},
-        unsubscribe: function() { return Promise.resolve(); }
+        unsubscribe: function() { return Promise.resolve(); },
+        receive: function() { return Promise.resolve(); }
     }
 
     describe("with default keepalive", function() {
@@ -102,6 +103,28 @@ describe("api/editor/comms", function() {
                 ws.close();
                 done();
             });
+        });
+
+        it('delivers published messages to the runtime', function(done) {
+            var receive = sinon.stub(mockComms,"receive").resolves();
+            var ws = new WebSocket(url);
+            ws.on('open', function() {
+                ws.send(JSON.stringify({topic:"plugin/action",data:{value:"hello"}}));
+            });
+            setTimeout(function() {
+                try {
+                    receive.calledOnce.should.be.true();
+                    receive.firstCall.args[0].should.have.property("topic","plugin/action");
+                    receive.firstCall.args[0].should.have.property("data",{value:"hello"});
+                    receive.firstCall.args[0].client.should.have.property("session").which.is.a.String();
+                    receive.restore();
+                    ws.close();
+                    done();
+                } catch(err) {
+                    receive.restore();
+                    done(err);
+                }
+            },100);
         });
 
         it('malformed messages are ignored',function(done) {
@@ -609,6 +632,83 @@ describe("api/editor/comms", function() {
                     done();
                 } catch(err) {
                     done(err);
+                }
+            });
+        });
+        it('delivers anonymous messages while completing the initial connection',function(done) {
+            var receive = sinon.stub(mockComms,"receive").resolves();
+            var ws = new WebSocket(url);
+            ws.on('open', function() {
+                ws.send(JSON.stringify({topic:"plugin/anonymous-action",data:{value:"hello"}}));
+            });
+            setTimeout(function() {
+                try {
+                    receive.calledOnce.should.be.true();
+                    receive.firstCall.args[0].should.have.property("topic","plugin/anonymous-action");
+                    receive.firstCall.args[0].should.have.property("data",{value:"hello"});
+                    receive.restore();
+                    ws.close();
+                    done();
+                } catch(err) {
+                    receive.restore();
+                    done(err);
+                }
+            },100);
+        });
+        it('upgrades and downgrades an active connection without reconnecting',function(done) {
+            var getUser = sinon.stub(Users,"get").callsFake(function(username) {
+                if (username === "fred") {
+                    return Promise.resolve({username:"fred",permissions:"*"});
+                }
+                return Promise.resolve(null);
+            });
+            var getToken = sinon.stub(Tokens,"get").callsFake(function(token) {
+                if (token === "1234") {
+                    return Promise.resolve({user:"fred",scope:["*"]});
+                }
+                return Promise.resolve(null);
+            });
+            var receive = sinon.stub(mockComms,"receive").callsFake(function(opts) {
+                if (opts.topic === "whoami") {
+                    if (receive.callCount === 1) {
+                        opts.user.should.have.property("username","fred");
+                        ws.send(JSON.stringify({auth:null}));
+                    } else {
+                        try {
+                            opts.user.should.not.have.property("username");
+                            getUser.restore();
+                            getToken.restore();
+                            receive.restore();
+                            ws.close();
+                            done();
+                        } catch(err) {
+                            done(err);
+                        }
+                    }
+                }
+                return Promise.resolve();
+            });
+            var authResponses = 0;
+            var ws = new WebSocket(url);
+            ws.on('open', function() {
+                ws.send(JSON.stringify({auth:"1234"}));
+            });
+            ws.on('message', function(msg) {
+                if (JSON.parse(msg).auth === "ok") {
+                    authResponses++;
+                    ws.send(JSON.stringify({topic:"whoami"}));
+                }
+            });
+            ws.on('close', function() {
+                if (getUser.called || getToken.called) {
+                    getUser.restore();
+                    getToken.restore();
+                }
+                if (receive.called) {
+                    receive.restore();
+                }
+                if (authResponses !== 2) {
+                    done(new Error("Expected two auth acknowledgements, got "+authResponses));
                 }
             });
         });

@@ -24,12 +24,15 @@ const registryUtil = NR_TEST_UTILS.require("@node-red/registry/lib/util");
 const runtime = NR_TEST_UTILS.require("@node-red/runtime")._;
 
 const i18n = NR_TEST_UTILS.require("@node-red/util").i18n;
+const events = NR_TEST_UTILS.require("@node-red/util").events;
 
 describe("red/nodes/registry/util",function() {
     describe("createNodeApi", function() {
         let i18n_;
         let registerType;
         let registerSubflow;
+        let commsSubscribeInbound;
+        let commsUnsubscribeInbound;
 
         before(function() {
             i18n_ = sinon.stub(i18n,"_").callsFake(function() {
@@ -37,11 +40,15 @@ describe("red/nodes/registry/util",function() {
             })
             registerType = sinon.stub(runtime.nodes,"registerType");
             registerSubflow = sinon.stub(runtime.nodes,"registerSubflow");
+            commsSubscribeInbound = sinon.stub(runtime.comms,"subscribeInbound").resolves();
+            commsUnsubscribeInbound = sinon.stub(runtime.comms,"unsubscribeInbound").resolves();
         });
         after(function() {
             i18n_.restore();
             registerType.restore();
             registerSubflow.restore();
+            commsSubscribeInbound.restore();
+            commsUnsubscribeInbound.restore();
         })
 
         it("builds node-specific view of runtime api", function() {
@@ -69,6 +76,22 @@ describe("red/nodes/registry/util",function() {
             registerSubflow.lastCall.args[0].should.eql("my-node")
             registerSubflow.lastCall.args[1].should.eql(subflowDef)
 
+            const emit = sinon.stub(events, "emit");
+            result.comms.publish("topic","data",true,"session-1","session-2");
+            emit.calledWith("comms",{
+                topic:"topic",
+                data:"data",
+                retain:true,
+                session:"session-1",
+                excludeSession:"session-2"
+            }).should.be.true();
+            emit.restore();
+
+            const inboundCallback = function() {};
+            result.comms.subscribe("plugin/#",inboundCallback);
+            commsSubscribeInbound.calledWith({topic:"plugin/#",callback:inboundCallback}).should.be.true();
+            result.comms.unsubscribe("plugin/#",inboundCallback);
+            commsUnsubscribeInbound.calledWith({topic:"plugin/#",callback:inboundCallback}).should.be.true();
         });
     });
     describe("checkModuleAllowed", function() {
